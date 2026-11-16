@@ -57,7 +57,10 @@ type PartialEditorControls = Partial<PersistedEditorControls>;
 
 type PresetAutoCaptionSettings = ProjectEditorState["autoCaptionSettings"];
 type PresetCropRegion = ProjectEditorState["cropRegion"];
-type PresetWebcamSettings = Omit<ProjectEditorState["webcam"], "sourcePath" | "visibleRanges">;
+type PresetWebcamSettings = Omit<
+	ProjectEditorState["webcam"],
+	"sourcePath" | "visibleRanges" | "loop"
+>;
 
 export interface EditorPresetSnapshot extends Omit<PersistedEditorControls, "webcam"> {
 	borderRadiusUnit: "percent";
@@ -75,6 +78,7 @@ export interface EditorPreset {
 }
 
 export interface EditorPreferences extends PersistedEditorControls, ExportPreferences {
+	autoApplyFreshRecordingAutoZooms: boolean;
 	borderRadiusUnit: "percent";
 	customAspectWidth: string;
 	customAspectHeight: string;
@@ -91,6 +95,7 @@ export const EDITOR_PRESETS_STORAGE_KEY = "recordly.editor.presets";
 const DEFAULT_EDITOR_CONTROLS = normalizeProjectEditor({});
 
 export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
+	autoApplyFreshRecordingAutoZooms: true,
 	wallpaper: DESKTOP_WALLPAPER,
 	shadowIntensity: DEFAULT_EDITOR_CONTROLS.shadowIntensity,
 	backgroundBlur: DEFAULT_EDITOR_CONTROLS.backgroundBlur,
@@ -198,6 +203,7 @@ function normalizeEditorPresetSnapshot(candidate: unknown): EditorPresetSnapshot
 	const {
 		sourcePath: _sourcePath,
 		visibleRanges: _visibleRanges,
+		loop: _loop,
 		...webcam
 	} = normalizedControls.webcam;
 
@@ -326,10 +332,7 @@ function normalizeEditorControls(
 		cursorIdleHide: sanitizedRaw.cursorIdleHide ?? fallback.cursorIdleHide,
 		borderRadius: sanitizedRaw.borderRadius ?? fallback.borderRadius,
 		padding: sanitizedRaw.padding ?? fallback.padding,
-		webcam: {
-			...(sanitizedRaw.webcam ?? fallback.webcam),
-			shape: sanitizedRaw.webcam?.shape ?? fallback.webcam.shape,
-		},
+		webcam: sanitizedRaw.webcam ?? fallback.webcam,
 		aspectRatio: sanitizedRaw.aspectRatio ?? fallback.aspectRatio,
 	};
 
@@ -373,7 +376,13 @@ function normalizeEditorControls(
 		cursorIdleHide: normalized.cursorIdleHide,
 		borderRadius: normalized.borderRadius,
 		padding: normalized.padding,
-		webcam: normalized.webcam,
+		webcam: {
+			...normalized.webcam,
+			shape:
+				sanitizedRaw.webcam?.shape == null
+					? fallback.webcam.shape
+					: normalized.webcam.shape,
+		},
 		aspectRatio: normalized.aspectRatio,
 	};
 }
@@ -413,6 +422,10 @@ export function normalizeEditorPreferences(
 		),
 		customGradients: normalizeCustomGradients(raw.customGradients ?? fallback.customGradients),
 		customColors: normalizeCustomColors(raw.customColors ?? fallback.customColors),
+		autoApplyFreshRecordingAutoZooms:
+			typeof raw.autoApplyFreshRecordingAutoZooms === "boolean"
+				? raw.autoApplyFreshRecordingAutoZooms
+				: fallback.autoApplyFreshRecordingAutoZooms,
 		whisperExecutablePath:
 			normalizeNullablePath(raw.whisperExecutablePath) ?? fallback.whisperExecutablePath,
 		whisperModelPath: normalizeNullablePath(raw.whisperModelPath) ?? fallback.whisperModelPath,

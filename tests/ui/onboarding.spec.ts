@@ -41,6 +41,30 @@ test("dedicated onboarding route fills its own window", async ({ page }) => {
 	await expect(page.locator("html")).toHaveAttribute("data-onboarding-closed", "true");
 });
 
+test("Replay logo reveal stays in Dev settings and can be used again", async ({ page }) => {
+	await installDesktopBridge(page);
+	await installDesktopBridgeOverrides(page, () => {
+		let replays = 0;
+		window.electronAPI.replayOnboardingIntro = async () => {
+			document.documentElement.dataset.introReplays = String(++replays);
+			return true;
+		};
+	});
+	await page.goto("/?windowType=editor");
+	await openDevSettings(page);
+	const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+	const replay = settings.getByRole("button", { name: "Replay logo reveal" });
+	await replay.click();
+	await expect(page.locator("html")).toHaveAttribute("data-intro-replays", "1");
+	await replay.click();
+	await expect(page.locator("html")).toHaveAttribute("data-intro-replays", "2");
+	await expect(settings.getByRole("tab", { name: "Dev", exact: true })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(page.getByRole("dialog", { name: "Welcome to Recordly" })).toHaveCount(0);
+});
+
 test("Show onboarding opens directly after onboarding was completed", async ({ page }) => {
 	await installDesktopBridge(page);
 	await installDesktopBridgeOverrides(page, () => {
@@ -551,24 +575,25 @@ for (const platform of ["win32", "linux"]) {
 	});
 }
 
-test("HUD routes missing permissions to onboarding without opening System Settings on launch", async ({
-	page,
-}) => {
-	await installDesktopBridge(page);
-	await page.addInitScript(() => {
-		window.electronAPI.getScreenRecordingPermissionStatus = async () => ({
-			success: true,
-			status: "denied",
+productionTest(
+	"HUD routes missing permissions to onboarding without opening System Settings on launch",
+	async ({ page }) => {
+		await installDesktopBridge(page);
+		await page.addInitScript(() => {
+			window.electronAPI.getScreenRecordingPermissionStatus = async () => ({
+				success: true,
+				status: "denied",
+			});
+			window.electronAPI.openScreenRecordingPreferences = async () => {
+				document.documentElement.dataset.settingsOpened = "true";
+				return { success: true };
+			};
 		});
-		window.electronAPI.openScreenRecordingPreferences = async () => {
-			document.documentElement.dataset.settingsOpened = "true";
-			return { success: true };
-		};
-	});
-	await page.goto("/?windowType=hud-overlay");
-	await expect(page.locator("html")).toHaveAttribute("data-permissions-opened", "true");
-	await expect(page.locator("html")).not.toHaveAttribute("data-settings-opened");
-});
+		await page.goto("/?windowType=hud-overlay");
+		await expect(page.locator("html")).toHaveAttribute("data-permissions-opened", "true");
+		await expect(page.locator("html")).not.toHaveAttribute("data-settings-opened");
+	},
+);
 
 productionTest(
 	"a permission request opens its page even after onboarding was already completed",
@@ -598,14 +623,18 @@ productionTest(
 );
 
 for (const platform of ["darwin", "win32", "linux"]) {
-	test(`${platform} HUD requires a Supabase session before recording`, async ({ page }) => {
-		await installDesktopBridge(page, "preview.mp4", { signedIn: false, onboarded: false });
-		await page.addInitScript((platform) => {
-			window.electronAPI.getPlatform = async () => platform;
-		}, platform);
-		await page.goto("/?windowType=hud-overlay");
-		await expect(page.locator("html")).toHaveAttribute("data-permissions-opened", "true");
-	});
+	productionTest(
+		`${platform} HUD routes a missing session to sign-in without requesting permissions`,
+		async ({ page }) => {
+			await installDesktopBridge(page, "preview.mp4", { signedIn: false, onboarded: false });
+			await page.addInitScript((platform) => {
+				window.electronAPI.getPlatform = async () => platform;
+			}, platform);
+			await page.goto("/?windowType=hud-overlay");
+			await expect(page.locator("html")).toHaveAttribute("data-dashboard-opened", "true");
+			await expect(page.locator("html")).not.toHaveAttribute("data-permissions-opened");
+		},
+	);
 }
 
 for (const signedIn of [true, false]) {
@@ -635,7 +664,8 @@ for (const signedIn of [true, false]) {
 		const tour = page.getByRole("dialog", { name: "Welcome to Recordly" });
 		await expect(tour).toHaveAttribute("data-onboarding-state", "login");
 		await expect(tour.getByRole("heading", { name: "Welcome to Recordly" })).toBeVisible();
-		await expect(tour.getByPlaceholder("you@example.com")).toBeVisible();
+		await expect(tour.getByPlaceholder("you@example.com")).toHaveCount(signedIn ? 0 : 1);
+		if (signedIn) await expect(tour.getByText("test@email.com", { exact: true })).toBeVisible();
 		await expect(tour.getByText("Your account", { exact: true })).toHaveCount(0);
 		await expect(page.locator("html")).toHaveAttribute(
 			"data-welcome-music",
@@ -707,7 +737,8 @@ test("Review permission setup uses onboarding preview in development", async ({ 
 	await page.getByRole("button", { name: "Review permission setup", exact: true }).click();
 	await expect(page.locator("html")).toHaveAttribute("data-preview-requested", "true");
 	const tour = page.getByRole("dialog", { name: "Welcome to Recordly", exact: true });
-	await expect(tour.getByPlaceholder("you@example.com")).toBeVisible();
+	await expect(tour.getByPlaceholder("you@example.com")).toHaveCount(0);
+	await expect(tour.getByText("test@email.com", { exact: true })).toBeVisible();
 	await tour.getByRole("button", { name: "Continue", exact: true }).click();
 	await expect(tour.getByRole("navigation")).toBeVisible();
 	await expect(tour.getByRole("button", { name: "Back to account" })).toBeVisible();

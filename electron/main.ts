@@ -1,3 +1,4 @@
+import { createReleaseVersionCatalog } from "./releaseVersions";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,6 +17,12 @@ import {
 	Tray,
 } from "electron";
 import { nativeT, setNativeLocale } from "./nativeI18n";
+import {
+	captureEditorMenuTarget,
+	createEditorCommandMenus,
+	withHiddenDockEditorMenus,
+	type ProjectMenuAction,
+} from "./editorCommandMenu";
 import { validateAppLocaleRequest } from "./localeIpc";
 import { readAppSetting, writeAppSetting } from "./appSettingsStore";
 import { refreshDesktopPresenceLocale } from "./desktopPresence";
@@ -42,7 +49,11 @@ import { recordingFocus } from "./ipc/recording/focus";
 import { clearRecordingTrashUndo } from "./ipc/recording/library";
 import { resolveDisplayMediaSource } from "./ipc/register/sourceMapping";
 import { ensureMediaServer } from "./mediaServer";
-import { hardenWebContentsNavigation, shouldHardenWebContentsType } from "./navigationPolicy";
+import {
+	hardenWebContentsNavigation,
+	isInternalRendererTarget,
+	shouldHardenWebContentsType,
+} from "./navigationPolicy";
 import { shouldGrantDisplayCapture, shouldGrantMediaPermission } from "./permissionPolicy";
 import { ensurePackagedRendererServer, getPackagedRendererBaseUrl } from "./rendererServer";
 import { createSaveBeforeCloseController } from "./saveBeforeClose";
@@ -71,11 +82,13 @@ import {
 	createEditorWindow,
 	createHudOverlayWindow,
 	createSourceSelectorWindow,
+	focusOnboardingWindow,
 	getHudOverlayWindow,
 	getOnboardingWindow,
 	getUpdateToastWindow,
 	hideUpdateToastWindow,
 	isHudOverlayMousePassthroughSupported,
+	replayOnboardingIntro,
 	reassertHudOverlayMousePassthrough as reassertHudOverlayMouseState,
 	setHudOverlayRecordingActive,
 	showOnboardingWindow,
@@ -84,6 +97,8 @@ import {
 
 const electronMainDir = path.dirname(fileURLToPath(import.meta.url));
 const IS_SMOKE_EXPORT = process.env.RECORDLY_SMOKE_EXPORT === "1";
+let startupWindowsReady = false;
+let firstRunIntroStarted = false;
 initializeInstanceSession();
 
 function ignoreBrokenConsolePipe(stream: NodeJS.WritableStream | undefined) {
@@ -98,6 +113,10 @@ function ignoreBrokenConsolePipe(stream: NodeJS.WritableStream | undefined) {
 ipcMain.handle("show-onboarding-window", (_event, options?: { preview?: boolean }) => {
 	showOnboardingWindow({ preview: !app.isPackaged && options?.preview === true });
 	return true;
+});
+ipcMain.handle("replay-onboarding-intro", (event) => {
+	const owner = BrowserWindow.fromWebContents(event.sender);
+	return owner ? replayOnboardingIntro(owner) : false;
 });
 ipcMain.handle("close-onboarding-window", () => {
 	closeOnboardingWindow();
@@ -393,14 +412,7 @@ function canRestartForUpdate() {
 }
 
 function createWindow() {
-	if (!app.isReady()) {
-		void app.whenReady().then(() => {
-			if (!mainWindow || mainWindow.isDestroyed()) {
-				createWindow();
-			}
-		});
-		return;
-	}
+	if (!startupWindowsReady) return;
 
 	if (isCreatingMainWindow) {
 		return;
@@ -418,6 +430,11 @@ function createWindow() {
 		return;
 	}
 
+	if (app.isPackaged && readAppSetting("recordly.onboarding.v1.seen") !== true) {
+		showOnboardingWindow({ intro: claimFirstRunIntro() });
+		return;
+	}
+
 	isCreatingMainWindow = true;
 	const createdHudWindow = createHudOverlayWindow();
 	mainWindow = createdHudWindow;
@@ -430,19 +447,27 @@ function createWindow() {
 	isCreatingMainWindow = false;
 }
 
+function claimFirstRunIntro() {
+	if (firstRunIntroStarted) return false;
+	firstRunIntroStarted = true;
+	const introStartedKey = "recordly.onboarding.introStarted";
+	if (readAppSetting(introStartedKey) === true) return false;
+	const resumingPermissions = readAppSetting("recordly.onboarding.permissionsRequested") === true;
+	try {
+		writeAppSetting(introStartedKey, true);
+	} catch (error) {
+		console.warn("[onboarding] Could not save reveal progress", error);
+	}
+	return !resumingPermissions;
+}
+
 function focusOrCreateMainWindow() {
+	if (!startupWindowsReady) return;
 	const onboarding = getOnboardingWindow();
 	if (onboarding) {
-		restoreWindowSafely(onboarding);
+		focusOnboardingWindow();
 		return;
 	}
-	if (!app.isReady()) {
-		void app.whenReady().then(() => {
-			focusOrCreateMainWindow();
-		});
-		return;
-	}
-
 	const updateToast = getUpdateToastWindow();
 	if (updateToast?.isVisible()) {
 		updateToast.show();
@@ -504,9 +529,28 @@ function isEditorWindow(window: BrowserWindow) {
 	return window.webContents.getURL().includes("windowType=editor");
 }
 
-function sendEditorMenuAction(
-	channel: "menu-load-project" | "menu-save-project" | "menu-save-project-as",
-) {
+function isOwnedEditorWindow(window: BrowserWindow): boolean {
+	return (
+		!window.isDestroyed() &&
+		BrowserWindow.fromId(window.id) === window &&
+		!window.webContents.isDestroyed() &&
+		isEditorWindow(window) &&
+		getTrustedCaptureDocumentBaseUrls().some((base) =>
+			isInternalRendererTarget(base, window.webContents.getURL()),
+		)
+	);
+}
+
+function sendEditorMenuAction(channel: ProjectMenuAction, capturedTarget?: BrowserWindow) {
+	if (!startupWindowsReady) return;
+	if (getOnboardingWindow()) {
+		focusOnboardingWindow();
+		return;
+	}
+	if (capturedTarget) {
+		if (isOwnedEditorWindow(capturedTarget)) capturedTarget.webContents.send(channel);
+		return;
+	}
 	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
 
 	if (!targetWindow || targetWindow.isDestroyed() || !isEditorWindow(targetWindow)) {
@@ -530,6 +574,15 @@ function sendEditorMenuAction(
 function setupApplicationMenu() {
 	const isMac = process.platform === "darwin";
 	const template: Electron.MenuItemConstructorOptions[] = [];
+	const editorMenus = createEditorCommandMenus({
+		translate: nativeT,
+		onProjectAction: sendEditorMenuAction,
+	});
+	if (!isMac)
+		editorMenus[0].submenu.push(
+			{ type: "separator" },
+			{ label: nativeT("quit"), role: "quit", accelerator: "CmdOrCtrl+Q" },
+		);
 	if (isMac) {
 		template.push({
 			label: app.name,
@@ -548,48 +601,7 @@ function setupApplicationMenu() {
 	}
 
 	template.push(
-		{
-			label: nativeT("file"),
-			submenu: [
-				{
-					label: nativeT("openProjects"),
-					accelerator: "CmdOrCtrl+O",
-					click: () => sendEditorMenuAction("menu-load-project"),
-				},
-				{
-					label: nativeT("saveProject"),
-					accelerator: "CmdOrCtrl+S",
-					click: () => sendEditorMenuAction("menu-save-project"),
-				},
-				{
-					label: nativeT("saveProjectAs"),
-					accelerator: "CmdOrCtrl+Shift+S",
-					click: () => sendEditorMenuAction("menu-save-project-as"),
-				},
-				...(isMac
-					? []
-					: [
-							{ type: "separator" as const },
-							{
-								label: nativeT("quit"),
-								role: "quit" as const,
-								accelerator: "CmdOrCtrl+Q",
-							},
-						]),
-			],
-		},
-		{
-			label: nativeT("edit"),
-			submenu: [
-				{ label: nativeT("undo"), role: "undo" },
-				{ label: nativeT("redo"), role: "redo" },
-				{ type: "separator" },
-				{ label: nativeT("cut"), role: "cut" },
-				{ label: nativeT("copy"), role: "copy" },
-				{ label: nativeT("paste"), role: "paste" },
-				{ label: nativeT("selectAll"), role: "selectAll" },
-			],
-		},
+		...editorMenus,
 		{
 			label: nativeT("view"),
 			submenu: [
@@ -680,6 +692,8 @@ function createTray() {
 
 	if (process.platform === "win32" || process.platform === "darwin") {
 		tray.on("right-click", () => {
+			if (process.platform === "darwin" && app.dock && !app.dock.isVisible())
+				updateTrayMenu(desktopRecordingActive);
 			if (!tray || !trayContextMenu) {
 				return;
 			}
@@ -713,13 +727,12 @@ function getTrayIcon(filename: string) {
 }
 
 function syncDockIcon() {
-	if (process.platform !== "darwin" || !app.dock) {
+	// The packaged app uses the native icon from its macOS bundle.
+	if (process.platform !== "darwin" || app.isPackaged || !app.dock) {
 		return;
 	}
 
-	const dockIcon = getAppImage(
-		IS_DEV ? "app-icons/recordly-solid-blue-512.png" : getPlatformAppIconFilename(512),
-	);
+	const dockIcon = getAppImage("app-icons/recordly-solid-blue-512.png");
 	if (!dockIcon.isEmpty()) {
 		app.dock.setIcon(dockIcon);
 	}
@@ -834,6 +847,27 @@ ipcMain.handle("skip-update-version", () => {
 
 ipcMain.handle("get-current-update-toast-payload", () => {
 	return getCurrentUpdateToastPayload();
+});
+
+const releaseVersionCatalog = createReleaseVersionCatalog(process.platform, process.arch);
+ipcMain.handle("list-release-versions", async () => {
+	if (process.windowsStore || process.mas) return { success: true, versions: [] };
+	try {
+		return { success: true, versions: await releaseVersionCatalog.list() };
+	} catch {
+		return { success: false, versions: [] };
+	}
+});
+ipcMain.handle("download-release-version", async (_event, tag: unknown) => {
+	if (process.windowsStore || process.mas) return { success: false };
+	const installer = releaseVersionCatalog.installer(tag);
+	if (!installer) return { success: false };
+	try {
+		await shell.openExternal(installer);
+		return { success: true };
+	} catch {
+		return { success: false };
+	}
 });
 
 ipcMain.handle("get-update-status-summary", () => {
@@ -955,7 +989,24 @@ function updateTrayMenu(recording: boolean = false) {
 					},
 				},
 			];
-	const menu = Menu.buildFromTemplate(menuTemplate);
+	const focused = BrowserWindow.getFocusedWindow();
+	const target = captureEditorMenuTarget(
+		getOnboardingWindow()
+			? null
+			: focused && isOwnedEditorWindow(focused)
+				? focused
+				: mainWindow,
+		isOwnedEditorWindow,
+	);
+	const menu = Menu.buildFromTemplate(
+		withHiddenDockEditorMenus(menuTemplate, {
+			platform: process.platform,
+			dockVisible: app.dock?.isVisible() ?? true,
+			translate: nativeT,
+			onProjectAction: sendEditorMenuAction,
+			target,
+		}),
+	);
 	trayContextMenu = menu;
 	tray.setImage(trayIcon);
 	tray.setToolTip(trayToolTip);
@@ -1261,12 +1312,12 @@ app.whenReady().then(async () => {
 			if (recording) {
 				reassertHudOverlayMouseState();
 			}
-			if (!recording) {
-				restoreWindowSafely(mainWindow);
-			}
+			// Idle updates also follow cancelled starts and discarded recordings.
+			// Only the explicit editor handoff should reveal/focus the editor.
 		},
 		authCallbacks.flowStorageHooks,
 	);
+	startupWindowsReady = true;
 
 	if (IS_SMOKE_EXPORT || process.env.RECORDLY_DEV_OPEN_RECORDING_INPUT) {
 		await logSmokeExportGpuDiagnostics();

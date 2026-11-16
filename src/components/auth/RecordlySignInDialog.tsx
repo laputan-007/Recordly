@@ -18,7 +18,7 @@ import {
 	signInWithSocial,
 	signOutRecordly,
 } from "@/lib/auth/recordlyAuth";
-import { RecordlySignInFields } from "./RecordlySignInFields";
+import { RecordlySignInFields, SIGN_IN_PROVIDER_CHECK_TIMEOUT_MS } from "./RecordlySignInFields";
 import { FirstBootMusic } from "./FirstBootMusic";
 import {
 	OnboardingBody,
@@ -91,7 +91,7 @@ export function RecordlySignInDialog({
 	// A cached user or background refresh must not dismiss a requested sign-in.
 	// Only a completed interactive sign-in can finish reauthentication.
 	const reauthenticating = reason === "reauthenticate";
-	const user = reauthenticating || preview ? null : signedInUser;
+	const user = reauthenticating ? null : signedInUser;
 	const [directSignInComplete, setDirectSignInComplete] = useState(false);
 	const openedAuthenticationVersion = useRef<number | undefined>(undefined);
 	useEffect(() => {
@@ -130,15 +130,12 @@ export function RecordlySignInDialog({
 	const [reportDiagnostic, setReportDiagnostic] = useState<string>();
 	const [linkSent, setLinkSent] = useState(false);
 	const [providers, setProviders] = useState<RecordlyOAuthProvider[]>([]);
-	const [loadingProviders, setLoadingProviders] = useState(false);
 	const [providersKnown, setProvidersKnown] = useState(false);
 
 	useEffect(() => {
 		if (!open || !configured || user) return;
-		let disposed = false;
 		const controller = new AbortController();
-		const timeout = window.setTimeout(() => controller.abort(), 10000);
-		setLoadingProviders(true);
+		const timeout = window.setTimeout(() => controller.abort(), SIGN_IN_PROVIDER_CHECK_TIMEOUT_MS);
 		setProvidersKnown(false);
 		setProviders([]);
 		void getEnabledSignInProviders(controller.signal)
@@ -149,15 +146,13 @@ export function RecordlySignInDialog({
 				}
 			})
 			.catch((error) => {
-				// Email remains available to retry when provider discovery cannot reach Auth.
+				// Allow sign-in attempts when provider availability could not be checked.
 				if (!controller.signal.aborted) captureAuthFailure("provider-discovery", error);
 			})
 			.finally(() => {
 				window.clearTimeout(timeout);
-				if (!disposed) setLoadingProviders(false);
 			});
 		return () => {
-			disposed = true;
 			window.clearTimeout(timeout);
 			controller.abort();
 		};
@@ -187,8 +182,8 @@ export function RecordlySignInDialog({
 	useEffect(() => {
 		if (!open || opened.current) return;
 		opened.current = true;
-		if (onboarding && user) setShowPermissions(true);
-	}, [open, onboarding, user]);
+		if (onboarding && user && !preview) setShowPermissions(true);
+	}, [open, onboarding, user, preview]);
 
 	useEffect(() => {
 		if (open && startWithPermissions && user) setShowPermissions(true);
@@ -205,10 +200,13 @@ export function RecordlySignInDialog({
 			awaitingSignIn.current = false;
 			setMessage(undefined);
 			setReportDiagnostic(undefined);
-			if (onboarding) setShowPermissions(true);
-			else onAuthenticated();
+			if (onboarding) {
+				// Restoring a cached session must not jump an optional tour away
+				// from its account page. The real flow still advances after sign-in.
+				if (!preview) setShowPermissions(true);
+			} else onAuthenticated();
 		}
-	}, [open, user, onAuthenticated, onboarding]);
+	}, [open, user, onAuthenticated, onboarding, preview]);
 
 	const run = async (label: SignInAction, action: () => Promise<unknown>) => {
 		setBusy(label);
@@ -276,9 +274,9 @@ export function RecordlySignInDialog({
 					>
 						{onboarding ? (
 							<OnboardingHeader
-								centered={!user}
+								centered={preview || !user}
 								title={
-									user ? (
+									user && !preview ? (
 										ot("yourAccount")
 									) : (
 										<OnboardingHeroTitle text={ot("welcomeTitle")} />
@@ -341,14 +339,12 @@ export function RecordlySignInDialog({
 									void run(provider, () => signInWithSocial(provider, consent))
 								}
 								providers={providers}
-								loadingProviders={loadingProviders}
 								providersKnown={providersKnown}
 								configured={configured}
 								busy={busy}
 								compact={onboarding}
 								assetBase={import.meta.env.BASE_URL}
 								labels={{
-									loadingProviders: ot("loadingProviders"),
 									checkInbox: ot("checkInbox"),
 									code: ot("code"),
 									verifyCode: ot("verifyCode"),
@@ -439,10 +435,8 @@ export function RecordlySignInDialog({
 							<div
 								aria-hidden="true"
 								data-onboarding-window-drag
-								className="onboarding-window-drag absolute left-0 right-12 top-0 z-30 flex h-8 justify-center pt-2"
-							>
-								<span className="h-1 w-10 rounded-full bg-foreground/20" />
-							</div>
+								className="onboarding-window-drag absolute left-0 right-12 top-0 z-30 h-8"
+							/>
 						)}
 						{onboarding ? (
 							<OnboardingLayout

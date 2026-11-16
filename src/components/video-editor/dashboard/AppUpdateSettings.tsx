@@ -1,3 +1,4 @@
+import { AppVersionPicker } from "./AppVersionPicker";
 import { ProgressBar } from "@heroui/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ErrorReportButton } from "@/components/feedback/ErrorReportButton";
@@ -269,6 +270,10 @@ export function AppUpdateSettings() {
 						</p>
 					</div>
 					<div className={styles.actions}>
+						<AppVersionPicker
+							currentVersion={version || summary?.currentVersion || ""}
+							disabled={busy || checking || downloading}
+						/>
 						<Button
 							size="sm"
 							variant={ready || available ? "default" : "secondary"}
